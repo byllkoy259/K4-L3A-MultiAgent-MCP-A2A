@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -11,11 +12,21 @@ from mcp.client.streamable_http import streamable_http_client
 
 from .contracts import Contracts
 
+CALL_TIMEOUT_SECONDS = 90.0
+CALL_ATTEMPTS = 3
+
+
+class ToolCallError(RuntimeError):
+    """The MCP server answered with an error result (e.g. the record does not exist)."""
+
 
 class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        # One call in flight per session: agents may run concurrently, but the audited
+        # gateway sees the same strictly sequential traffic as a single-threaded client.
+        self._one_at_a_time = asyncio.Lock()
 
     async def list_tools(self) -> list[str]:
         response = await self._session.list_tools()
@@ -23,15 +34,30 @@ class EvidenceGateway:
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
-        result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        # Tools are read-only, so retrying a timed-out call is idempotent.
+        async with self._one_at_a_time:
+            for attempt in range(1, CALL_ATTEMPTS + 1):
+                try:
+                    result = await asyncio.wait_for(
+                        self._session.call_tool(tool_name, arguments=payload),
+                        CALL_TIMEOUT_SECONDS,
+                    )
+                    break
+                except TimeoutError:
+                    if attempt == CALL_ATTEMPTS:
+                        raise
+        # mcp>=2 renamed isError -> is_error; accept both.
+        is_error = getattr(result, "is_error", None)
+        if is_error is None:
+            is_error = getattr(result, "isError", False)
+        if is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
-            raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
-        evidence = getattr(result, "structuredContent", None)
+            raise ToolCallError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
+        evidence = getattr(result, "structured_content", None)
         if evidence is None:
-            evidence = getattr(result, "structured_content", None)
+            evidence = getattr(result, "structuredContent", None)
         if evidence is None:
             text_blocks = [block.text for block in result.content if getattr(block, "text", None)]
             if len(text_blocks) != 1:
