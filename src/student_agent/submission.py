@@ -65,6 +65,8 @@ def validate_artifacts(
         raise ValueError("traces/trace.jsonl is missing or not UTF-8") from exc
     normalized_lines: list[str] = []
     seen_events: set[str] = set()
+    consumed: dict[str, set[str]] = {case_id: set() for case_id in expected}
+    lifecycle: dict[str, list[str]] = {case_id: [] for case_id in expected}
     for number, line in enumerate(trace_lines, 1):
         if not line.strip():
             continue
@@ -79,6 +81,22 @@ def validate_artifacts(
             raise ValueError(f"traces/trace.jsonl:{number}: duplicate event_id")
         seen_events.add(event["event_id"])
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+        if event["event_type"] == "tool_result_consumed":
+            consumed[event["case_id"]].update(event.get("evidence_refs", []))
+        if event["event_type"] in ("case_received", "case_finalized"):
+            lifecycle[event["case_id"]].append(event["event_type"])
+
+    # Outputs the scorer would hard-gate to 0 must never reach a submission.
+    for case_id in case_set.case_ids:
+        refs = outputs[case_id]["evidence_refs"]
+        if not refs:
+            raise ValueError(f"outputs/{case_id}.json cites no evidence; re-run the case")
+        unlinked = sorted(set(refs) - consumed[case_id])
+        if unlinked:
+            raise ValueError(f"outputs/{case_id}.json cites refs not consumed in its trace: "
+                             f"{unlinked[:3]}")
+        if lifecycle[case_id] != ["case_received", "case_finalized"]:
+            raise ValueError(f"traces/trace.jsonl: {case_id} lifecycle is {lifecycle[case_id]}")
 
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):

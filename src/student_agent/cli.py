@@ -15,6 +15,7 @@ from mcp_types import CONNECTION_CLOSED
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
+from .evidence import EvidenceUnavailable
 from .mcp_gateway import EvidenceGateway, connect_gateway
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
@@ -35,6 +36,8 @@ async def _show_tools(root: Path) -> None:
 
 MAX_RECONNECTS = 5
 REPLAY_AFTER_RECONNECT = 5
+# Gateway outages seen so far lasted about 80s; these waits cover ~4 minutes.
+CASE_RETRY_DELAYS = (5, 15, 30, 60, 120)
 TRANSPORT_ERRORS = (httpx2.TransportError, anyio.ClosedResourceError, anyio.EndOfStream)
 
 
@@ -78,6 +81,27 @@ async def _solve_one(
     trace.commit()
 
 
+async def _solve_with_retry(
+    case: dict[str, Any],
+    gateway: EvidenceGateway,
+    trace: TraceWriter,
+    contracts: Contracts,
+    output_root: Path,
+) -> None:
+    """Re-run a case while the gateway errors on records every case has; give up loudly
+    instead of writing an output with no evidence."""
+    for attempt, delay in enumerate((*CASE_RETRY_DELAYS, None), 1):
+        try:
+            await _solve_one(case, gateway, trace, contracts, output_root)
+            return
+        except EvidenceUnavailable as exc:
+            trace.rollback()
+            if delay is None:
+                raise RuntimeError(f"{exc} after {attempt} attempts; run again later") from exc
+            print(f"WARN: {exc}; retrying in {delay}s", file=sys.stderr)
+            await asyncio.sleep(delay)
+
+
 async def _run(root: Path, only: list[str] | None = None) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
@@ -105,7 +129,7 @@ async def _run(root: Path, only: list[str] | None = None) -> None:
                 if not await gateway.list_tools():
                     raise RuntimeError("MCP Gateway returned no tools")
                 while pending:
-                    await _solve_one(
+                    await _solve_with_retry(
                         case_set.cases[pending[0]], gateway, trace, contracts, output_root
                     )
                     completed.append(pending.pop(0))

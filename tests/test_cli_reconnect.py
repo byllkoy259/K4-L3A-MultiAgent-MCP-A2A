@@ -9,8 +9,14 @@ from pathlib import Path
 from typing import Any
 
 import httpx2
+import pytest
 
 from student_agent import cli
+from student_agent.cases import CaseSet
+from student_agent.contracts import Contracts
+from student_agent.evidence import EvidenceUnavailable
+from student_agent.submission import validate_artifacts
+from student_agent.trace import TraceWriter
 
 ROOT = Path(__file__).resolve().parents[1]
 CASE_IDS = [f"CASE_{i:03d}" for i in range(1, 101)]
@@ -81,3 +87,38 @@ def test_connection_drop_reruns_recent_cases_without_duplicate_events(
     assert all(per_case[(case_id, "case_received")] == 1 for case_id in CASE_IDS)
     assert all(per_case[(case_id, "case_finalized")] == 1 for case_id in CASE_IDS)
     assert len(list((tmp_path / "outputs").glob("*.json"))) == 100
+
+
+def test_case_is_retried_while_required_evidence_is_unavailable(monkeypatch: Any) -> None:
+    attempts: list[int] = []
+
+    async def flaky(case: dict[str, Any], *_: Any) -> None:
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise EvidenceUnavailable(case["case_id"], {"get_order": "Error executing tool"})
+
+    class Trace:
+        def rollback(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "CASE_RETRY_DELAYS", (0, 0, 0))
+    monkeypatch.setattr(cli, "_solve_one", flaky)
+    asyncio.run(cli._solve_with_retry({"case_id": "CASE_001"}, None, Trace(), None, Path(".")))
+    assert len(attempts) == 3
+
+    attempts.clear()
+    monkeypatch.setattr(cli, "CASE_RETRY_DELAYS", (0,))
+    with pytest.raises(RuntimeError, match="after 2 attempts"):
+        asyncio.run(cli._solve_with_retry({"case_id": "CASE_001"}, None, Trace(), None, Path(".")))
+
+
+def test_validate_refuses_an_output_without_evidence(tmp_path: Path) -> None:
+    contracts = Contracts(ROOT / "contracts" / "schemas")
+    case_set = CaseSet("test-v1", "l3a", ("CASE_001",), {})
+    (tmp_path / "outputs").mkdir()
+    (tmp_path / "outputs" / "CASE_001.json").write_text(json.dumps(minimal_output("CASE_001")))
+    trace = TraceWriter(tmp_path / "traces" / "trace.jsonl", contracts)
+    trace.emit(case_id="CASE_001", event_type="case_received", actor="coordinator")
+    trace.emit(case_id="CASE_001", event_type="case_finalized", actor="coordinator")
+    with pytest.raises(ValueError, match="cites no evidence"):
+        validate_artifacts(tmp_path, case_set, contracts)

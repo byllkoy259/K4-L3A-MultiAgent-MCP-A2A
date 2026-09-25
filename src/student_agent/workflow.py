@@ -17,7 +17,7 @@ from typing import Any
 from .a2a import A2AChannel
 from .agents import OrderAgent, PaymentAgent, PolicyAgent, Resolution, ShipmentAgent
 from .analysis import CaseFacts, Diagnosis, OrderFacts, PaymentFacts, ShipmentFacts, parse_time
-from .evidence import EvidenceLedger
+from .evidence import EvidenceLedger, EvidenceUnavailable
 from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
 from .verifier import CHECKS, verify
@@ -27,6 +27,8 @@ VERIFIER = "verifier"
 REFUND_REQUEST_TOPIC = "requested_full_refund"
 ORDER_TOOLS = ("get_order", "get_order_items", "get_sellers")
 PAYMENT_TOOLS = ("get_payment_timeline", "get_refund_timeline")
+# Every case has these records; only the refund timeline is legitimately absent.
+REQUIRED_TOOLS = (*ORDER_TOOLS, "get_payment_timeline", "get_shipment_summary", "get_policy")
 
 # Evidence each conclusion rests on; only these refs are cited (precision over volume).
 CITED_TOOLS: dict[str, tuple[str, ...]] = {
@@ -137,6 +139,11 @@ class Coordinator:
                 evidence_refs=self.ledger.refs(["get_shipment_summary"]),
                 attributes=_shipment_attributes(shipment),
             )
+        # A required tool that errored is an outage, not an answer: retry the whole case
+        # rather than finalize one with no evidence (a guaranteed hard gate).
+        failed = {t: m for t, m in self.ledger.failures.items() if t in REQUIRED_TOOLS}
+        if failed:
+            raise EvidenceUnavailable(self.case_id, failed)
         missing = tuple(
             name for name, value in (("order", order), ("payment", payment),
                                      ("shipment", shipment)) if value is None

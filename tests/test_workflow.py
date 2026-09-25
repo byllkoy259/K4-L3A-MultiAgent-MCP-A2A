@@ -10,7 +10,7 @@ import pytest
 import synthetic as s
 from student_agent.agents import OrderAgent, ToolPermissionError
 from student_agent.contracts import Contracts
-from student_agent.evidence import EvidenceLedger
+from student_agent.evidence import EvidenceLedger, EvidenceUnavailable
 from student_agent.mcp_gateway import ToolCallError
 from student_agent.trace import TraceWriter
 from student_agent.workflow import solve_case
@@ -100,13 +100,20 @@ def test_no_action_case_has_no_refund(tmp_path: Path) -> None:
     }
 
 
-def test_missing_order_becomes_insufficient_evidence(tmp_path: Path) -> None:
+def test_gateway_error_on_required_tool_is_not_finalized(tmp_path: Path) -> None:
     data = world(s.order(), get_order=None)
-    output, _, gateway = run("CASE_004", "canceled_order_paid", data, tmp_path)
+    with pytest.raises(EvidenceUnavailable, match="get_order"):
+        run("CASE_004", "canceled_order_paid", data, tmp_path)
+
+
+def test_malformed_payment_evidence_becomes_insufficient_evidence(tmp_path: Path) -> None:
+    data = world(s.order(status="canceled", delivered=None),
+                 get_payment_timeline={"unexpected": "shape"})
+    output, _, _ = run("CASE_006", "canceled_order_paid", data, tmp_path)
 
     assert output["assessment"]["primary_issue"] == "insufficient_evidence"
     assert output["financial_resolution"]["recommended_refund_brl"] == 0.0
-    assert "get_payment_timeline" not in gateway.calls  # no window, so nothing to scope
+    assert output["evidence_refs"]  # still cites what it did read, so it is scorable
 
 
 def test_specialists_cannot_call_tools_they_do_not_own(tmp_path: Path) -> None:

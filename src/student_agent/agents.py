@@ -44,13 +44,18 @@ class Specialist:
         self.ledger = ledger
 
     async def fetch(self, tool: str, **arguments: str) -> Evidence | None:
-        """Call one owned tool. Returns None when the record does not exist or the call
-        keeps timing out -- missing evidence is reported, never filled in."""
+        """Call one owned tool. Returns None when the call fails; the failure is recorded
+        in the ledger so the coordinator can tell a transient outage from a normal
+        absence -- missing evidence is reported, never filled in."""
         if tool not in self.tools:
             raise ToolPermissionError(f"{self.name} may not call {tool}")
         try:
             response = await self.gateway.call(tool, case_id=self.case_id, **arguments)
-        except (ToolCallError, TimeoutError):
+        except ToolCallError as exc:
+            self.ledger.fail(tool, str(exc)[-160:])
+            return None
+        except TimeoutError:
+            self.ledger.fail(tool, "timed out")
             return None
         evidence = Evidence(
             ref=response["evidence_ref"], tool=tool, domain=response["domain"],
