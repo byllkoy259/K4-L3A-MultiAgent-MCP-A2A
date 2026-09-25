@@ -34,3 +34,7 @@ dist/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local exploration (MCP response cache, may contain case data)
+.cache/
+scripts/

@@ -6,6 +6,9 @@ import json
 import sys
 from pathlib import Path
 
+import httpx2
+from mcp.shared.exceptions import MCPError
+
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
@@ -27,6 +30,39 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
+# A dropped MCP connection kills the whole session, so recovery happens per case:
+# fresh session, discarded partial trace, backoff, then the case is solved again.
+CASE_RETRY_DELAYS = (10.0, 30.0, 60.0, 120.0)
+RETRYABLE_CASE_ERRORS = (RuntimeError, OSError, httpx2.HTTPError, MCPError, ExceptionGroup)
+
+
+async def _solve_with_retries(
+    settings: Settings, contracts: Contracts, trace: TraceWriter, case: dict
+) -> dict:
+    case_id = case["case_id"]
+    for attempt in range(len(CASE_RETRY_DELAYS) + 1):
+        trace.begin_case()
+        try:
+            async with connect_gateway(
+                settings.mcp_endpoint, settings.team_api_key, contracts
+            ) as gateway:
+                trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                output = await solve_case(case, gateway, trace)
+        except RETRYABLE_CASE_ERRORS as exc:
+            trace.rollback_case()
+            if attempt == len(CASE_RETRY_DELAYS):
+                raise RuntimeError(f"{case_id}: giving up after retries: {exc!r}") from exc
+            delay = CASE_RETRY_DELAYS[attempt]
+            print(
+                f"WARN: {case_id} attempt {attempt + 1} failed ({exc!r}); retry in {delay}s",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(delay)
+            continue
+        return output
+    raise AssertionError("unreachable")
+
+
 async def _run(root: Path) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
@@ -42,22 +78,22 @@ async def _run(root: Path) -> None:
 
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    if not discovered_tools:
+        raise RuntimeError("MCP Gateway returned no tools")
+    for case_id in case_set.case_ids:
+        case = case_set.cases[case_id]
+        output = await _solve_with_retries(settings, contracts, trace, case)
+        contracts.validate_output(output, f"outputs/{case_id}.json")
+        if output.get("case_id") != case_id:
+            raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+        target = output_root / f"{case_id}.json"
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        temporary.replace(target)
+        trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+        trace.commit_case()
 
 
 def parser() -> argparse.ArgumentParser:
