@@ -33,6 +33,16 @@ class TraceWriter:
     def rollback(self) -> None:
         self._pending = None
 
+    def discard_cases(self, case_ids: set[str]) -> None:
+        """Remove already-committed events of these cases so they can be re-run."""
+        if not self.path.exists():
+            return
+        kept = [
+            line for line in self.path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and json.loads(line)["case_id"] not in case_ids
+        ]
+        self.path.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+
     def emit(
         self,
         *,

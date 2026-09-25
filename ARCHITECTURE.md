@@ -133,7 +133,7 @@ Sau khi có issue, policy-agent áp `rules[issue]` của policy:
 | Failure | Retry? | Fallback | Trace event/code |
 | --- | --- | --- | --- |
 | MCP timeout | Có, tối đa 3 lần/call (90 giây mỗi lần) | Coi domain đó là thiếu; nếu là domain bắt buộc → `insufficient_evidence` | handoff `*_EVIDENCE_MISSING`; `policy_decided` với `rule_basis=REQUIRED_EVIDENCE_MISSING` |
-| Mất kết nối MCP | Có, reconnect tối đa 5 lần | Rollback trace của case đang dở (trace được đệm theo case), rồi chạy lại case đó | Không có event dở dang nào trong trace |
+| Mất kết nối MCP | Có, reconnect tối đa 5 lần | Rollback trace của case đang dở (trace được đệm theo case). Chạy lại case đó cùng **5 case vừa xong trước đó** trong session mới, vì các call ngay trước lúc rớt có thể chưa vào audit của server | Trace và output của các case chạy lại được thay mới; không có event trùng |
 | Not found | Không | Order không tồn tại → `insufficient_evidence`; refund không tồn tại → "chưa có refund" | handoff `ORDER_EVIDENCE_MISSING` hoặc attribute `refund_events_in_window=0` |
 | Source conflict | Không | Ghi vào `data_conflicts`, chọn nguồn gốc của từng field, trừ confidence 0.1 | handoff attribute `conflicts` |
 | Invalid specialist result | Không | Payload sai cấu trúc (`InvalidEvidence`) → domain coi là thiếu | handoff `*_EVIDENCE_MISSING` |
@@ -166,9 +166,9 @@ CLI kiểm tra lại schema và `case_id` lần nữa trước khi ghi file.
 - **Tính quyết định:** cùng một bộ MCP evidence luôn cho ra cùng output. Chỉ có `evidence_ref` và `event_id` thay đổi giữa các lần chạy.
 - **Concurrency:**
   - Các case chạy tuần tự trên một MCP session.
-  - Trong một case, tối đa 3 call song song (order-agent), rồi 2 specialist chạy song song.
+  - Các agent vẫn chạy đồng thời (order + policy, rồi payment + shipment). Tuy vậy, `EvidenceGateway` dùng lock nên **mỗi thời điểm chỉ có 1 MCP call**: server audit nhận traffic tuần tự như một client đơn luồng.
   - Mỗi case gọi 7 tool.
-- **Giới hạn:** timeout 90 giây/call × 3 lần; reconnect tối đa 5 lần; tối đa 40 A2A message/case.
+- **Giới hạn:** timeout 90 giây/call × 3 lần; reconnect tối đa 5 lần (mỗi lần chạy lại 5 case gần nhất); tối đa 40 A2A message/case.
 - **Lệnh:**
 
   ```bash

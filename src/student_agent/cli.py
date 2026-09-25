@@ -34,6 +34,7 @@ async def _show_tools(root: Path) -> None:
 
 
 MAX_RECONNECTS = 5
+REPLAY_AFTER_RECONNECT = 5
 TRANSPORT_ERRORS = (httpx2.TransportError, anyio.ClosedResourceError, anyio.EndOfStream)
 
 
@@ -94,6 +95,7 @@ async def _run(root: Path, only: list[str] | None = None) -> None:
     if unknown:
         raise ValueError(f"unknown case ids: {unknown}")
     pending = [case_id for case_id in case_set.case_ids if not only or case_id in only]
+    completed: list[str] = []
     reconnects = 0
     while pending:
         try:
@@ -106,7 +108,8 @@ async def _run(root: Path, only: list[str] | None = None) -> None:
                     await _solve_one(
                         case_set.cases[pending[0]], gateway, trace, contracts, output_root
                     )
-                    print(f"done {pending.pop(0)} ({len(pending)} left)", file=sys.stderr)
+                    completed.append(pending.pop(0))
+                    print(f"done {completed[-1]} ({len(pending)} left)", file=sys.stderr)
         except BaseException as exc:
             trace.rollback()
             if not _connection_lost(exc):
@@ -119,7 +122,16 @@ async def _run(root: Path, only: list[str] | None = None) -> None:
             reconnects += 1
             if reconnects > MAX_RECONNECTS:
                 raise RuntimeError(f"MCP connection lost {reconnects} times; giving up") from exc
-            print(f"WARN: MCP connection lost at {pending[0]}; reconnecting", file=sys.stderr)
+            # Calls made just before an abrupt disconnect may never reach the server's
+            # audit log, so the last few finished cases are re-run in the new session too.
+            replay = completed[-REPLAY_AFTER_RECONNECT:]
+            del completed[-REPLAY_AFTER_RECONNECT:]
+            trace.discard_cases(set(replay))
+            for case_id in replay:
+                (output_root / f"{case_id}.json").unlink(missing_ok=True)
+            pending[:0] = replay
+            print(f"WARN: MCP connection lost at {pending[len(replay)]}; reconnecting and "
+                  f"re-running {len(replay)} earlier case(s)", file=sys.stderr)
 
 
 def parser() -> argparse.ArgumentParser:

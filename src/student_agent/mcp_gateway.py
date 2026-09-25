@@ -24,6 +24,9 @@ class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        # One call in flight per session: agents may run concurrently, but the audited
+        # gateway sees the same strictly sequential traffic as a single-threaded client.
+        self._one_at_a_time = asyncio.Lock()
 
     async def list_tools(self) -> list[str]:
         response = await self._session.list_tools()
@@ -32,15 +35,17 @@ class EvidenceGateway:
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         # Tools are read-only, so retrying a timed-out call is idempotent.
-        for attempt in range(1, CALL_ATTEMPTS + 1):
-            try:
-                result = await asyncio.wait_for(
-                    self._session.call_tool(tool_name, arguments=payload), CALL_TIMEOUT_SECONDS
-                )
-                break
-            except TimeoutError:
-                if attempt == CALL_ATTEMPTS:
-                    raise
+        async with self._one_at_a_time:
+            for attempt in range(1, CALL_ATTEMPTS + 1):
+                try:
+                    result = await asyncio.wait_for(
+                        self._session.call_tool(tool_name, arguments=payload),
+                        CALL_TIMEOUT_SECONDS,
+                    )
+                    break
+                except TimeoutError:
+                    if attempt == CALL_ATTEMPTS:
+                        raise
         # mcp>=2 renamed isError -> is_error; accept both.
         is_error = getattr(result, "is_error", None)
         if is_error is None:
