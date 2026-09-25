@@ -68,7 +68,8 @@ def test_connection_drop_reruns_recent_cases_without_duplicate_events(
         yield Gateway()
 
     async def solve(case: dict[str, Any], gateway: Any, trace: Any) -> dict[str, Any]:
-        if len(sessions) == 1 and case["case_id"] == DROP_AT:
+        dropped = len(sessions) == 1 and case["case_id"] == DROP_AT
+        if dropped or len(sessions) in (2, 3):  # sessions 2 and 3 die on their first case
             raise httpx2.RemoteProtocolError("Server disconnected")
         solved.append(case["case_id"])
         trace.emit(case_id=case["case_id"], event_type="task_assigned", actor="coordinator")
@@ -76,11 +77,16 @@ def test_connection_drop_reruns_recent_cases_without_duplicate_events(
 
     monkeypatch.setattr(cli, "connect_gateway", connect)
     monkeypatch.setattr(cli, "solve_case", solve)
+    monkeypatch.setattr(cli, "RECONNECT_DELAYS", (0, 0, 0, 0, 0, 0))
     asyncio.run(cli._run(tmp_path))
 
-    assert sessions == [1, 2]
-    rerun = [case_id for case_id, n in Counter(solved).items() if n == 2]
-    assert rerun == [f"CASE_{i:03d}" for i in range(3, 8)]  # the 5 cases before the drop
+    assert sessions == [1, 2, 3, 4]
+    counts = Counter(solved)
+    rerun = [case_id for case_id, n in counts.items() if n == 2]
+    # Only the 5 cases finished before the first drop are re-run; the sessions that
+    # died without finishing anything do not push the replay further back.
+    assert rerun == [f"CASE_{i:03d}" for i in range(3, 8)]
+    assert max(counts.values()) == 2
     events = [json.loads(line)
               for line in (tmp_path / "traces" / "trace.jsonl").read_text().splitlines()]
     per_case = Counter((e["case_id"], e["event_type"]) for e in events)

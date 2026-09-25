@@ -34,8 +34,9 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
-MAX_RECONNECTS = 5
 REPLAY_AFTER_RECONNECT = 5
+# Waits between reconnects while no case finishes (reset by every finished case).
+RECONNECT_DELAYS = (5, 15, 30, 60, 120, 180)
 # Gateway outages seen so far lasted about 80s; these waits cover ~4 minutes.
 CASE_RETRY_DELAYS = (5, 15, 30, 60, 120)
 TRANSPORT_ERRORS = (httpx2.TransportError, anyio.ClosedResourceError, anyio.EndOfStream)
@@ -119,9 +120,9 @@ async def _run(root: Path, only: list[str] | None = None) -> None:
     if unknown:
         raise ValueError(f"unknown case ids: {unknown}")
     pending = [case_id for case_id in case_set.case_ids if not only or case_id in only]
-    completed: list[str] = []
-    reconnects = 0
+    failures_in_a_row = 0
     while pending:
+        finished_this_session: list[str] = []
         try:
             async with connect_gateway(
                 settings.mcp_endpoint, settings.team_api_key, contracts
@@ -132,8 +133,10 @@ async def _run(root: Path, only: list[str] | None = None) -> None:
                     await _solve_with_retry(
                         case_set.cases[pending[0]], gateway, trace, contracts, output_root
                     )
-                    completed.append(pending.pop(0))
-                    print(f"done {completed[-1]} ({len(pending)} left)", file=sys.stderr)
+                    finished_this_session.append(pending.pop(0))
+                    failures_in_a_row = 0
+                    print(f"done {finished_this_session[-1]} ({len(pending)} left)",
+                          file=sys.stderr)
         except BaseException as exc:
             trace.rollback()
             if not _connection_lost(exc):
@@ -143,19 +146,23 @@ async def _run(root: Path, only: list[str] | None = None) -> None:
                 if len(leaves) == 1 and leaves[0] is not exc:
                     raise leaves[0] from None
                 raise
-            reconnects += 1
-            if reconnects > MAX_RECONNECTS:
-                raise RuntimeError(f"MCP connection lost {reconnects} times; giving up") from exc
+            if failures_in_a_row == len(RECONNECT_DELAYS):
+                raise RuntimeError(
+                    f"MCP connection failed {failures_in_a_row + 1} times in a row "
+                    f"without finishing a case; run again later") from exc
+            delay = RECONNECT_DELAYS[failures_in_a_row]
+            failures_in_a_row += 1
             # Calls made just before an abrupt disconnect may never reach the server's
-            # audit log, so the last few finished cases are re-run in the new session too.
-            replay = completed[-REPLAY_AFTER_RECONNECT:]
-            del completed[-REPLAY_AFTER_RECONNECT:]
+            # audit log, so the last cases finished in the dead session are re-run too.
+            # A session that finished nothing adds nothing, so retries never walk back.
+            replay = finished_this_session[-REPLAY_AFTER_RECONNECT:]
             trace.discard_cases(set(replay))
             for case_id in replay:
                 (output_root / f"{case_id}.json").unlink(missing_ok=True)
             pending[:0] = replay
-            print(f"WARN: MCP connection lost at {pending[len(replay)]}; reconnecting and "
-                  f"re-running {len(replay)} earlier case(s)", file=sys.stderr)
+            print(f"WARN: MCP connection lost at {pending[len(replay)]}; re-running "
+                  f"{len(replay)} earlier case(s) after {delay}s", file=sys.stderr)
+            await asyncio.sleep(delay)
 
 
 def parser() -> argparse.ArgumentParser:
