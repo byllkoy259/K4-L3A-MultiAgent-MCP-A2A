@@ -24,9 +24,9 @@ outputs/*
 !outputs/.gitkeep
 traces/*
 !traces/.gitkeep
-dist/*
-!dist/.gitkeep
-*.zip
+
+
+
 *.log
 
 # Editors and operating systems
